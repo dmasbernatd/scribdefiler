@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated output
+*.pdf
+
+# Debug / probe artifacts
+*.png
+_probe.py
+
+# Local virtualenvs
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
