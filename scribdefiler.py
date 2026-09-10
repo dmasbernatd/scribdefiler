@@ -28,31 +28,94 @@ CONSENT_SELECTORS = [
     'button:has-text("Agree")',
 ]
 
-# Scroll the inner .document_scroller container (the real scroller — body
+# Scroll the inner .document_scroller container (the real scroller - body
 # scrollHeight is 0) from top to bottom so every page lazy-loads its content.
+# scrollHeight grows while we scroll, so re-read it every iteration and only
+# stop once the bottom has been reached and the height stops growing.
 SCROLL_SCRIPT = r"""
-async () => {
+async ({ stepPause, maxIterations, stableRounds }) => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const scroller =
         document.querySelector('.document_scroller') ||
         document.scrollingElement ||
         document.documentElement;
 
-    const total = scroller.scrollHeight;
-    const step = Math.max(400, Math.floor(scroller.clientHeight * 0.9));
-    let pos = 0;
-    while (pos < total) {
-        scroller.scrollTop = pos;
-        await sleep(250);
-        pos += step;
+    let iterations = 0;
+    let stable = 0;
+    while (iterations < maxIterations) {
+        iterations += 1;
+        const heightBefore = scroller.scrollHeight;
+        const step = Math.max(400, Math.floor(scroller.clientHeight * 0.9));
+        scroller.scrollTop = Math.min(scroller.scrollTop + step, heightBefore);
+        await sleep(stepPause);
+
+        const atBottom =
+            scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+        if (!atBottom) {
+            stable = 0;
+            continue;
+        }
+        // At the bottom: give lazy-loading a chance to append more pages.
+        await sleep(stepPause * 3);
+        stable = scroller.scrollHeight > heightBefore ? 0 : stable + 1;
+        if (stable >= stableRounds) break;
     }
-    // One last hop to the bottom in case totals grew while scrolling.
-    scroller.scrollTop = scroller.scrollHeight;
-    await sleep(600);
+
     scroller.scrollTop = 0;
     await sleep(400);
+    return {
+        iterations,
+        exhausted: iterations >= maxIterations && stable < stableRounds,
+        height: scroller.scrollHeight,
+        pages: document.querySelectorAll('.outer_page').length,
+    };
 };
 """
+
+# Wait until every .outer_page has actually rendered: all of its images decoded
+# (complete + naturalWidth > 0) and no page left visually empty. Polling this is
+# what keeps half-rendered pages out of the PDF.
+WAIT_RENDERED_SCRIPT = r"""
+async ({ timeoutMs, pollMs }) => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const imageReady = (img) => img.complete && img.naturalWidth > 0;
+    const pageBlank = (page) => {
+        if (page.querySelector('canvas')) return false;
+        const imgs = Array.from(page.querySelectorAll('img'));
+        if (imgs.some(imageReady)) return false;
+        return page.textContent.trim().length === 0;
+    };
+    const snapshot = () => {
+        const pages = Array.from(document.querySelectorAll('.outer_page'));
+        const imgs = Array.from(document.querySelectorAll('.outer_page img'));
+        return {
+            pages: pages.length,
+            images: imgs.length,
+            pendingImages: imgs.filter((i) => !imageReady(i)).length,
+            blankPages: pages.filter(pageBlank).length,
+        };
+    };
+
+    const deadline = Date.now() + timeoutMs;
+    let last = snapshot();
+    while (Date.now() < deadline) {
+        last = snapshot();
+        if (last.pages && !last.pendingImages && !last.blankPages) {
+            return { ...last, ok: true };
+        }
+        await sleep(pollMs);
+    }
+    return { ...last, ok: false };
+};
+"""
+
+# Tuning knobs for the two scripts above.
+SCROLL_STEP_PAUSE_MS = 250
+SCROLL_MAX_ITERATIONS = 2000
+SCROLL_STABLE_ROUNDS = 3
+RENDER_TIMEOUT_MS = 45_000
+RENDER_POLL_MS = 500
+MAX_SCROLL_PASSES = 3
 
 # Flatten the inner-scroll layout so all pages flow into the document body,
 # hide Scribd / Osano chrome, and force one Scribd page per PDF page.
@@ -132,11 +195,46 @@ async def fetch_pdf(doc_id: str, out_path: Path) -> None:
                     continue
 
             print("[3/5] Forcing all pages to lazy-load (scrolling inner container)...", file=sys.stderr)
-            await page.evaluate(SCROLL_SCRIPT)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-            except PWTimeout:
-                pass
+            render = None
+            for attempt in range(1, MAX_SCROLL_PASSES + 1):
+                scroll = await page.evaluate(
+                    SCROLL_SCRIPT,
+                    {
+                        "stepPause": SCROLL_STEP_PAUSE_MS,
+                        "maxIterations": SCROLL_MAX_ITERATIONS,
+                        "stableRounds": SCROLL_STABLE_ROUNDS,
+                    },
+                )
+                if scroll["exhausted"]:
+                    print(
+                        f"        Warning: scroll pass {attempt} hit the "
+                        f"{SCROLL_MAX_ITERATIONS}-iteration cap; the document may be truncated.",
+                        file=sys.stderr,
+                    )
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                except PWTimeout:
+                    pass
+
+                render = await page.evaluate(
+                    WAIT_RENDERED_SCRIPT,
+                    {"timeoutMs": RENDER_TIMEOUT_MS, "pollMs": RENDER_POLL_MS},
+                )
+                print(
+                    f"        Pass {attempt}: {render['pages']} pages, "
+                    f"{render['images'] - render['pendingImages']}/{render['images']} images loaded, "
+                    f"{render['blankPages']} blank.",
+                    file=sys.stderr,
+                )
+                if render["ok"]:
+                    break
+            else:
+                print(
+                    f"        Warning: after {MAX_SCROLL_PASSES} passes "
+                    f"{render['pendingImages']} images are still loading and "
+                    f"{render['blankPages']} pages look blank - exporting anyway.",
+                    file=sys.stderr,
+                )
 
             print("[4/5] Measuring page dimensions and flattening layout...", file=sys.stderr)
             dims = await page.evaluate(

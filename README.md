@@ -38,7 +38,7 @@ This writes `582827860.pdf` into the current working directory. Expect roughly o
 
 1. Loads `https://www.scribd.com/embeds/<id>/content?view_mode=scroll` in headless Chromium.
 2. Dismisses the Osano cookie-consent dialog if present.
-3. Scrolls Scribd's inner `.document_scroller` container top-to-bottom so every page lazy-loads its content into the DOM.
+3. Scrolls Scribd's inner `.document_scroller` container top-to-bottom so every page lazy-loads its content into the DOM. The container grows as pages arrive, so the scroll loop re-measures it on every step and only stops once the bottom is reached and the height has stopped changing. It then waits until every page has actually rendered (all images decoded, no blank pages), retrying the whole pass up to three times and warning on stderr if anything is still missing.
 4. Injects CSS that flattens the inner-scroll layout, hides Scribd chrome (header, footer, download button), and forces one Scribd page per PDF page.
 5. Measures the rendered `.outer_page` dimensions and calls Chromium's built-in PDF export at exactly those dimensions, with zero margins.
 
